@@ -8,9 +8,35 @@ let package = Package(
     platforms: [
         .macOS(.v13),
     ],
+    products: [
+        .library(
+            name: "FlexBankCore",
+            targets: ["FlexBankCore"]
+        ),
+        .executable(
+            name: "FlexBank",
+            targets: ["FlexBank"]
+        ),
+        .executable(
+            name: "FlexBankSeedDemo",
+            targets: ["FlexBankSeedDemo"]
+        ),
+    ],
     targets: [
+        .target(
+            name: "FlexBankCore"
+        ),
         .executableTarget(
-            name: "FlexBank"
+            name: "FlexBank",
+            dependencies: ["FlexBankCore"]
+        ),
+        .executableTarget(
+            name: "FlexBankSeedDemo",
+            dependencies: ["FlexBankCore"]
+        ),
+        .testTarget(
+            name: "FlexBankCoreTests",
+            dependencies: ["FlexBankCore"]
         ),
     ]
 )
