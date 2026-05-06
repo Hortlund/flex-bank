@@ -2,6 +2,7 @@ import Foundation
 
 public enum FlexStatsEngine {
     public static let minimumInsightSamples = 3
+    public static let heatmapFuturePaddingDays = 56
 
     public static func makeSnapshot(
         from events: [FlexEvent],
@@ -16,7 +17,12 @@ public enum FlexStatsEngine {
             for: calendar.date(byAdding: .day, value: -364, to: windowEnd) ?? windowEnd
         )
         let gridStart = startOfWeek(containing: windowStart, calendar: calendar)
-        let gridEnd = endOfWeek(containing: windowEnd, calendar: calendar)
+        let paddedWindowEnd = calendar.date(
+            byAdding: .day,
+            value: heatmapFuturePaddingDays,
+            to: windowEnd
+        ) ?? windowEnd
+        let gridEnd = endOfWeek(containing: paddedWindowEnd, calendar: calendar)
 
         let last30Start = calendar.startOfDay(
             for: calendar.date(byAdding: .day, value: -29, to: windowEnd) ?? windowEnd
@@ -43,11 +49,11 @@ public enum FlexStatsEngine {
         return FlexStatsSnapshot(
             daySummaries: daySummaries,
             last30NetMinutes: last30Summaries.reduce(0) { $0 + $1.netMinutes },
-            last30ActiveDays: last30Summaries.filter { !$0.events.isEmpty }.count,
+            last30ActiveDays: last30Summaries.filter { $0.activeEventCount > 0 }.count,
             currentQuickAddStreak: quickAddStreaks.current,
             bestQuickAddStreak: quickAddStreaks.best,
             thisMonthNetMinutes: thisMonthSummaries.reduce(0) { $0 + $1.netMinutes },
-            thisMonthLoggedDays: thisMonthSummaries.filter { !$0.events.isEmpty }.count,
+            thisMonthLoggedDays: thisMonthSummaries.filter { $0.activeEventCount > 0 }.count,
             quickAddWeekdays: makeWeekdayCounts(
                 from: sortedEvents.filter { $0.kind == .quickAdd },
                 calendar: calendar

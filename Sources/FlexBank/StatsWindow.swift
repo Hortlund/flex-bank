@@ -1,6 +1,5 @@
 import AppKit
 import Charts
-import Combine
 import FlexBankCore
 import SwiftUI
 
@@ -35,9 +34,9 @@ private struct StatsDashboardView: View {
     @State private var selectedMetric: FlexHeatmapMetric = .net
     @State private var selectedDay: Date?
     @State private var referenceDate = Date()
+    @State private var midnightRefreshTask: Task<Void, Never>?
 
     private let calendar = Calendar.autoupdatingCurrent
-    private let refreshTimer = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
         let snapshot = store.stats(referenceDate: referenceDate)
@@ -62,13 +61,14 @@ private struct StatsDashboardView: View {
         .background(StatsBackground())
         .onAppear {
             refreshSnapshot(at: Date())
+            startMidnightRefreshTask()
+        }
+        .onDisappear {
+            midnightRefreshTask?.cancel()
+            midnightRefreshTask = nil
         }
         .onChange(of: store.state.events.count) { _ in
             syncSelection(with: store.stats(referenceDate: referenceDate))
-        }
-        .onReceive(refreshTimer) { now in
-            guard !calendar.isDate(now, inSameDayAs: referenceDate) else { return }
-            refreshSnapshot(at: now)
         }
     }
 
@@ -87,6 +87,36 @@ private struct StatsDashboardView: View {
         }
 
         self.selectedDay = snapshot.daySummaries.last?.date ?? snapshot.heatmapWindowEndDate
+    }
+
+    private func startMidnightRefreshTask() {
+        midnightRefreshTask?.cancel()
+        midnightRefreshTask = Task { @MainActor in
+            while !Task.isCancelled {
+                let now = Date()
+                let nextDayStart = nextStartOfDay(after: now)
+                let delay = max(1, nextDayStart.timeIntervalSince(now))
+                let nanoseconds = UInt64(delay * 1_000_000_000)
+
+                do {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    return
+                }
+
+                guard !Task.isCancelled else { return }
+                refreshSnapshot(at: Date())
+            }
+        }
+    }
+
+    private func nextStartOfDay(after date: Date) -> Date {
+        if let interval = calendar.dateInterval(of: .day, for: date) {
+            return interval.end
+        }
+
+        let startOfDay = calendar.startOfDay(for: date)
+        return calendar.date(byAdding: .day, value: 1, to: startOfDay) ?? date.addingTimeInterval(24 * 60 * 60)
     }
 }
 
@@ -168,9 +198,9 @@ private struct DashboardHero: View {
                     subtitle: "\(snapshot.thisMonthLoggedDays) active day\(snapshot.thisMonthLoggedDays == 1 ? "" : "s")"
                 )
                 MetricTile(
-                    title: "Quick-add streak",
+                    title: "Active streak",
                     value: "\(snapshot.currentQuickAddStreak)d",
-                    subtitle: "Best \(snapshot.bestQuickAddStreak)d"
+                    subtitle: quickAddStreakSubtitle
                 )
                 MetricTile(
                     title: "History",
@@ -179,6 +209,14 @@ private struct DashboardHero: View {
                 )
             }
         }
+    }
+
+    private var quickAddStreakSubtitle: String {
+        if snapshot.currentQuickAddStreak > 0 {
+            return "Best \(snapshot.bestQuickAddStreak)d"
+        }
+
+        return "Best \(snapshot.bestQuickAddStreak)d · paused"
     }
 }
 
@@ -217,13 +255,13 @@ private struct HeatmapDashboardCard: View {
 
     var body: some View {
         StatsCard {
-            HStack(alignment: .top, spacing: 22) {
+            VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack(alignment: .top, spacing: 16) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text("Activity Heatmap")
                                 .font(.title3.weight(.semibold))
-                            Text("Columns are weeks, rows are weekdays. Tap a day for details.")
+                            Text("Columns are weeks, rows are weekdays. Click a day to inspect the logged changes.")
                                 .font(.callout)
                                 .foregroundStyle(StatsTheme.secondaryText)
                         }
@@ -254,16 +292,19 @@ private struct HeatmapDashboardCard: View {
                     )
                 }
 
-                Rectangle()
-                    .fill(StatsTheme.border)
-                    .frame(width: 1)
-                    .padding(.vertical, 4)
+                HStack(alignment: .top, spacing: 18) {
+                    DayInspectorCard(
+                        date: detailDate,
+                        summary: snapshot.summary(on: detailDate, calendar: calendar)
+                    )
+                    .frame(width: 320)
 
-                DayInspectorCard(
-                    date: detailDate,
-                    summary: snapshot.summary(on: detailDate, calendar: calendar)
-                )
-                .frame(width: 300)
+                    LoggedDaysCard(
+                        snapshot: snapshot,
+                        selectedDay: $selectedDay,
+                        calendar: calendar
+                    )
+                }
             }
         }
     }
@@ -620,6 +661,185 @@ private struct DayStatPill: View {
                         .stroke(tint.opacity(0.28), lineWidth: 1)
                 )
         )
+    }
+}
+
+private struct LoggedDaysCard: View {
+    let snapshot: FlexStatsSnapshot
+    @Binding var selectedDay: Date?
+    let calendar: Calendar
+
+    private var loggedDays: [FlexDaySummary] {
+        snapshot.daySummaries
+            .filter { $0.activeEventCount > 0 }
+            .sorted { $0.date > $1.date }
+    }
+
+    private var totalRemovedMinutes: Int {
+        loggedDays.reduce(0) { partialResult, summary in
+            partialResult + summary.removedMinutes
+        }
+    }
+
+    private var totalGainedMinutes: Int {
+        loggedDays.reduce(0) { partialResult, summary in
+            partialResult + summary.addedMinutes + summary.quickAddMinutes
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Logged Days")
+                        .font(.headline)
+                    Text("Recent days with quick adds, manual adds, and removed time.")
+                        .font(.callout)
+                        .foregroundStyle(StatsTheme.secondaryText)
+                }
+            }
+
+            HStack(spacing: 10) {
+                DayStatPill(
+                    title: "Logged",
+                    value: "\(loggedDays.count)",
+                    tint: Color(red: 0.12, green: 0.46, blue: 0.82)
+                )
+                DayStatPill(
+                    title: "Gained",
+                    value: formatUnsignedMinutes(totalGainedMinutes),
+                    tint: eventAccentColor(for: .manualAdd)
+                )
+                DayStatPill(
+                    title: "Removed",
+                    value: formatUnsignedMinutes(totalRemovedMinutes),
+                    tint: eventAccentColor(for: .manualRemove)
+                )
+            }
+
+            if loggedDays.isEmpty {
+                EmptyStateCard(
+                    title: "No logged days yet",
+                    message: "Use Quick add, Add time, or Remove time from the menu to populate this view."
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(loggedDays) { summary in
+                            LoggedDayRow(
+                                summary: summary,
+                                isSelected: selectedDay.map { calendar.isDate($0, inSameDayAs: summary.date) } ?? false
+                            ) {
+                                selectedDay = summary.date
+                            }
+                        }
+                    }
+                    .padding(.trailing, 4)
+                }
+                .frame(height: 300)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(StatsTheme.inspectorFill)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(StatsTheme.border, lineWidth: 1)
+                )
+        )
+    }
+}
+
+private struct LoggedDayRow: View {
+    let summary: FlexDaySummary
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 14) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(formatEventDate(summary.date))
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+
+                    HStack(spacing: 8) {
+                        ActivityMetricPill(
+                            title: "Net",
+                            value: formatSignedMinutes(summary.netMinutes),
+                            tint: metricAccentColor(for: .net, value: summary.netMinutes)
+                        )
+
+                        if summary.quickAddMinutes > 0 {
+                            ActivityMetricPill(
+                                title: "Quick",
+                                value: formatUnsignedMinutes(summary.quickAddMinutes),
+                                tint: eventAccentColor(for: .quickAdd)
+                            )
+                        }
+
+                        if summary.addedMinutes > 0 {
+                            ActivityMetricPill(
+                                title: "Added",
+                                value: formatUnsignedMinutes(summary.addedMinutes),
+                                tint: eventAccentColor(for: .manualAdd)
+                            )
+                        }
+
+                        if summary.removedMinutes > 0 {
+                            ActivityMetricPill(
+                                title: "Removed",
+                                value: formatUnsignedMinutes(summary.removedMinutes),
+                                tint: eventAccentColor(for: .manualRemove)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(minLength: 12)
+
+                Text("\(summary.events.count)")
+                    .font(.system(.headline, design: .rounded).weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(StatsTheme.secondaryText)
+                    .frame(width: 28, alignment: .trailing)
+            }
+            .padding(12)
+            .background(rowBackground)
+        }
+        .buttonStyle(.plain)
+        .help("\(formatEventDate(summary.date)): net \(formatSignedMinutes(summary.netMinutes)), removed \(formatUnsignedMinutes(summary.removedMinutes))")
+    }
+
+    private var rowBackground: some View {
+        RoundedRectangle(cornerRadius: 14, style: .continuous)
+            .fill(isSelected ? StatsTheme.todayAccent.opacity(0.13) : StatsTheme.subtleFill)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(isSelected ? StatsTheme.todayAccent.opacity(0.55) : Color.clear, lineWidth: 1)
+            )
+    }
+}
+
+private struct ActivityMetricPill: View {
+    let title: String
+    let value: String
+    let tint: Color
+
+    var body: some View {
+        Text("\(title) \(value)")
+            .font(.caption.weight(.medium))
+            .monospacedDigit()
+            .lineLimit(1)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .foregroundStyle(tint)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(tint.opacity(0.12))
+            )
     }
 }
 
@@ -1006,65 +1226,84 @@ private struct HeatmapView: View {
             weeks
                 .flatMap(\.days)
                 .compactMap { day in
-                    guard day.isWithinWindow else { return nil }
+                    guard day.isStatsWindowDate else { return nil }
                     return abs(day.summary?.value(for: metric) ?? 0)
                 }
                 .max() ?? 1
         )
 
-        ScrollView(.horizontal, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .bottom, spacing: axisSpacing) {
-                    Color.clear.frame(width: weekdayLabelWidth)
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .bottom, spacing: axisSpacing) {
+                        Color.clear.frame(width: weekdayLabelWidth)
 
-                    HeatmapMonthLabelsView(
-                        sections: monthSections,
-                        width: gridWidth,
-                        cellSize: cellSize,
-                        cellSpacing: cellSpacing,
-                        height: headerHeight
-                    )
-                }
-
-                HStack(alignment: .top, spacing: axisSpacing) {
-                    VStack(alignment: .trailing, spacing: cellSpacing) {
-                        ForEach(Array(weekdayLabels().enumerated()), id: \.offset) { index, label in
-                            Text(weekdayLabel(for: label, index: index))
-                                .font(.caption)
-                                .foregroundStyle(StatsTheme.secondaryText)
-                                .frame(width: weekdayLabelWidth, height: cellSize, alignment: .trailing)
-                        }
+                        HeatmapMonthLabelsView(
+                            sections: monthSections,
+                            width: gridWidth,
+                            cellSize: cellSize,
+                            cellSpacing: cellSpacing,
+                            height: headerHeight
+                        )
                     }
 
-                    HStack(alignment: .top, spacing: cellSpacing) {
-                        ForEach(weeks) { week in
-                            VStack(spacing: cellSpacing) {
-                                ForEach(week.days) { day in
-                                    HeatmapCell(
-                                        day: day,
-                                        metric: metric,
-                                        maxMagnitude: maxMagnitude,
-                                        isSelected: selectedDay.map { calendar.isDate($0, inSameDayAs: day.date) } ?? false,
-                                        isToday: calendar.isDate(day.date, inSameDayAs: today)
-                                    ) {
-                                        selectedDay = day.date
+                    HStack(alignment: .top, spacing: axisSpacing) {
+                        VStack(alignment: .trailing, spacing: cellSpacing) {
+                            ForEach(Array(weekdayLabels().enumerated()), id: \.offset) { index, label in
+                                Text(weekdayLabel(for: label, index: index))
+                                    .font(.caption)
+                                    .foregroundStyle(StatsTheme.secondaryText)
+                                    .frame(width: weekdayLabelWidth, height: cellSize, alignment: .trailing)
+                            }
+                        }
+
+                        HStack(alignment: .top, spacing: cellSpacing) {
+                            ForEach(weeks) { week in
+                                VStack(spacing: cellSpacing) {
+                                    ForEach(week.days) { day in
+                                        HeatmapCell(
+                                            day: day,
+                                            metric: metric,
+                                            maxMagnitude: maxMagnitude,
+                                            isSelected: selectedDay.map { calendar.isDate($0, inSameDayAs: day.date) } ?? false,
+                                            isToday: calendar.isDate(day.date, inSameDayAs: today)
+                                        ) {
+                                            selectedDay = day.date
+                                        }
+                                        .id(day.date)
+                                    }
+                                }
+                                .overlay(alignment: .leading) {
+                                    if week.startsMonth {
+                                        Rectangle()
+                                            .fill(StatsTheme.monthDivider)
+                                            .frame(width: 1)
+                                            .offset(x: -2.5)
                                     }
                                 }
                             }
-                            .overlay(alignment: .leading) {
-                                if week.startsMonth {
-                                    Rectangle()
-                                        .fill(StatsTheme.monthDivider)
-                                        .frame(width: 1)
-                                        .offset(x: -2.5)
-                                }
-                            }
                         }
                     }
                 }
+                .padding(.vertical, 4)
+                .padding(.trailing, 8)
             }
-            .padding(.vertical, 4)
-            .padding(.trailing, 8)
+            .onAppear {
+                scrollToFocusedDay(with: proxy)
+            }
+            .onChange(of: selectedDay) { _ in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    scrollToFocusedDay(with: proxy)
+                }
+            }
+        }
+    }
+
+    private func scrollToFocusedDay(with proxy: ScrollViewProxy) {
+        let focusDay = calendar.startOfDay(for: selectedDay ?? snapshot.heatmapWindowEndDate)
+
+        DispatchQueue.main.async {
+            proxy.scrollTo(focusDay, anchor: .center)
         }
     }
 
@@ -1129,17 +1368,20 @@ private struct HeatmapView: View {
         while cursor <= snapshot.heatmapGridEndDate {
             let weekDays = (0..<7).compactMap { offset -> HeatmapDay? in
                 guard let date = calendar.date(byAdding: .day, value: offset, to: cursor) else { return nil }
-                let inWindow = date >= snapshot.heatmapWindowStartDate && date <= snapshot.heatmapWindowEndDate
+                let isStatsWindowDate = date >= snapshot.heatmapWindowStartDate && date <= snapshot.heatmapWindowEndDate
+                let isVisibleCalendarDate = date >= snapshot.heatmapWindowStartDate && date <= snapshot.heatmapGridEndDate
                 return HeatmapDay(
                     date: date,
                     summary: snapshot.summary(on: date, calendar: calendar),
-                    isWithinWindow: inWindow
+                    isStatsWindowDate: isStatsWindowDate,
+                    isVisibleCalendarDate: isVisibleCalendarDate,
+                    isFutureDate: date > snapshot.heatmapWindowEndDate
                 )
             }
 
-            let firstVisibleDate = weekDays.first(where: { $0.isWithinWindow })?.date
+            let firstVisibleDate = weekDays.first(where: { $0.isVisibleCalendarDate })?.date
             let monthStartDate = weekDays.first { day in
-                guard day.isWithinWindow,
+                guard day.isVisibleCalendarDate,
                       let monthInterval = calendar.dateInterval(of: .month, for: day.date)
                 else {
                     return false
@@ -1225,16 +1467,28 @@ private struct HeatmapCell: View {
                     RoundedRectangle(cornerRadius: 5, style: .continuous)
                         .stroke(strokeColor, lineWidth: strokeWidth)
                 )
+                .overlay {
+                    if isSelected {
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(StatsTheme.selectedAccent, lineWidth: 2.4)
+                            .frame(width: 22, height: 22)
+                    }
+                }
+                .shadow(color: isSelected ? StatsTheme.selectedAccent.opacity(0.45) : .clear, radius: 5, x: 0, y: 0)
         }
         .buttonStyle(.plain)
-        .opacity(day.isWithinWindow ? 1 : 0.18)
-        .disabled(!day.isWithinWindow)
+        .opacity(opacity)
+        .disabled(!day.isVisibleCalendarDate)
         .help(tooltip)
     }
 
     private var fillColor: Color {
-        guard day.isWithinWindow else {
+        guard day.isVisibleCalendarDate else {
             return Color.clear
+        }
+
+        if day.isFutureDate {
+            return StatsTheme.futureDayFill
         }
 
         let value = day.summary?.value(for: metric) ?? 0
@@ -1243,11 +1497,15 @@ private struct HeatmapCell: View {
 
     private var strokeColor: Color {
         if isSelected {
-            return metricAccentColor(for: metric, value: day.summary?.value(for: metric) ?? 0).opacity(0.9)
+            return StatsTheme.selectedAccent
         }
 
         if isToday {
             return StatsTheme.todayAccent
+        }
+
+        if day.isFutureDate {
+            return StatsTheme.futureDayBorder
         }
 
         return StatsTheme.border
@@ -1255,7 +1513,7 @@ private struct HeatmapCell: View {
 
     private var strokeWidth: CGFloat {
         if isSelected {
-            return 1.8
+            return 2.2
         }
 
         if isToday {
@@ -1265,11 +1523,24 @@ private struct HeatmapCell: View {
         return 1
     }
 
+    private var opacity: Double {
+        if !day.isVisibleCalendarDate {
+            return 0.16
+        }
+
+        if day.isFutureDate {
+            return 0.62
+        }
+
+        return 1
+    }
+
     private var tooltip: String {
         let title = formatEventDate(day.date)
         let value = day.summary?.value(for: metric) ?? 0
         let todayLine = isToday ? "\nToday" : ""
-        return "\(title)\n\(metric.title): \(formatMetricValue(value, metric: metric))\(todayLine)"
+        let futureLine = day.isFutureDate ? "\nFuture calendar day" : ""
+        return "\(title)\n\(metric.title): \(formatMetricValue(value, metric: metric))\(todayLine)\(futureLine)"
     }
 }
 
@@ -1285,6 +1556,9 @@ private enum StatsTheme {
     static let gridLine = Color(nsColor: .separatorColor).opacity(0.55)
     static let secondaryText = Color(nsColor: .secondaryLabelColor)
     static let todayAccent = Color(nsColor: .controlAccentColor)
+    static let selectedAccent = Color(nsColor: .controlAccentColor)
+    static let futureDayFill = Color(nsColor: .quaternaryLabelColor).opacity(0.26)
+    static let futureDayBorder = Color(nsColor: .separatorColor).opacity(0.5)
     static let monthDivider = Color(nsColor: .separatorColor).opacity(0.62)
     static let shadow = Color.black.opacity(0.14)
 }
@@ -1313,7 +1587,9 @@ private struct HeatmapMonthSection: Identifiable {
 private struct HeatmapDay: Identifiable {
     let date: Date
     let summary: FlexDaySummary?
-    let isWithinWindow: Bool
+    let isStatsWindowDate: Bool
+    let isVisibleCalendarDate: Bool
+    let isFutureDate: Bool
 
     var id: Date { date }
 }

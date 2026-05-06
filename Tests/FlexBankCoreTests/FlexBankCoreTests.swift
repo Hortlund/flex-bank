@@ -107,6 +107,77 @@ struct FlexBankCoreTests {
     }
 
     @Test
+    func rollingStatsUseRealTimeEntriesAndPreserveDailyBreakdown() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        let events = [
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-01T07:30:00Z")!, kind: .quickAdd, deltaMinutes: 60),
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-01T16:45:00Z")!, kind: .manualRemove, deltaMinutes: -15),
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-02T12:00:00Z")!, kind: .balanceAdjustment, deltaMinutes: -45),
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-05T09:10:00Z")!, kind: .manualAdd, deltaMinutes: 30),
+            FlexEvent(occurredAt: formatter.date(from: "2026-04-01T09:10:00Z")!, kind: .manualAdd, deltaMinutes: 120),
+        ]
+
+        let snapshot = FlexStatsEngine.makeSnapshot(
+            from: events,
+            referenceDate: formatter.date(from: "2026-05-06T12:00:00Z")!,
+            calendar: calendar
+        )
+
+        #expect(snapshot.last30NetMinutes == 30)
+        #expect(snapshot.last30ActiveDays == 2)
+        #expect(snapshot.thisMonthNetMinutes == 30)
+        #expect(snapshot.thisMonthLoggedDays == 2)
+        #expect(snapshot.heatmapWindowEndDate == calendar.startOfDay(for: formatter.date(from: "2026-05-06T12:00:00Z")!))
+
+        let trailingPaddingDays = calendar.dateComponents(
+            [.day],
+            from: snapshot.heatmapWindowEndDate,
+            to: snapshot.heatmapGridEndDate
+        ).day ?? 0
+        #expect(trailingPaddingDays >= FlexStatsEngine.heatmapFuturePaddingDays)
+        #expect(trailingPaddingDays <= FlexStatsEngine.heatmapFuturePaddingDays + 6)
+
+        let mayFirst = snapshot.summary(on: formatter.date(from: "2026-05-01T12:00:00Z")!, calendar: calendar)
+        #expect(mayFirst?.netMinutes == 45)
+        #expect(mayFirst?.quickAddMinutes == 60)
+        #expect(mayFirst?.addedMinutes == 0)
+        #expect(mayFirst?.removedMinutes == 15)
+        #expect(mayFirst?.activeEventCount == 2)
+
+        let resetOnlyDay = snapshot.summary(on: formatter.date(from: "2026-05-02T12:00:00Z")!, calendar: calendar)
+        #expect(resetOnlyDay?.activeEventCount == 0)
+    }
+
+    @Test
+    func currentQuickAddStreakResetsAfterMissedWorkday() {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+
+        let formatter = ISO8601DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        let events = [
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-01T07:30:00Z")!, kind: .quickAdd, deltaMinutes: 30),
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-04T07:35:00Z")!, kind: .quickAdd, deltaMinutes: 30),
+            FlexEvent(occurredAt: formatter.date(from: "2026-05-05T07:40:00Z")!, kind: .quickAdd, deltaMinutes: 30),
+        ]
+
+        let snapshot = FlexStatsEngine.makeSnapshot(
+            from: events,
+            referenceDate: formatter.date(from: "2026-05-06T12:00:00Z")!,
+            calendar: calendar
+        )
+
+        #expect(snapshot.bestQuickAddStreak == 3)
+        #expect(snapshot.currentQuickAddStreak == 0)
+    }
+
+    @Test
     func weekdayRankingAndStreaksHandleWeekendCarry() {
         let formatter = ISO8601DateFormatter()
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
